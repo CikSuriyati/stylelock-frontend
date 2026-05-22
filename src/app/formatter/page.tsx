@@ -1,513 +1,1011 @@
 "use client";
 
-import { useState, useEffect } from "react";
+/**
+ * StyleLock — SciSpace-style formatter page.
+ *
+ * Pipeline:
+ *   .docx upload  ->  POST /ingest             -> StructuredDocument (editable)
+ *                  -> POST /render/{docx|pdf|html}  -> formatted output
+ *
+ * Same aesthetic as the legacy /transform page (dark glass, blue/orange accents),
+ * different innards: we now edit the structured editorial model directly and
+ * render to any target format from the same JSON.
+ */
+
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+// ------------ Types (mirror backend/renderers/schema.py) ------------
+
+type RunSpan = {
+    text: string;
+    bold?: boolean;
+    italic?: boolean;
+    underline?: boolean;
+    superscript?: boolean;
+    subscript?: boolean;
+};
+
+type HeadingBlock = { type: "heading"; level: "A" | "B" | "C"; text: string; numbering?: string | null };
+type ParagraphBlock = { type: "paragraph"; text?: string; runs?: RunSpan[]; style?: string; alignment?: string | null };
+type TableBlock = { type: "table"; caption?: string | null; header?: string[] | null; rows: string[][] };
+type FigureBlock = { type: "figure"; src?: string | null; caption?: string | null; alt?: string | null };
+type ReferenceBlock = { type: "reference"; raw: string; runs?: RunSpan[] };
+type EquationBlock = { type: "equation"; latex?: string | null; text?: string | null; number?: string | null };
+
+type Block = HeadingBlock | ParagraphBlock | TableBlock | FigureBlock | ReferenceBlock | EquationBlock;
+
+type DocumentMetadata = {
+    title?: string | null;
+    authors: string[];
+    affiliations: string[];
+    abstract?: string | null;
+    keywords?: string | null;
+    journal?: string | null;
+    volume?: string | null;
+    issue?: string | null;
+    year?: string | null;
+};
+
+type StructuredDocument = {
+    metadata: DocumentMetadata;
+    blocks: Block[];
+    extras?: Record<string, unknown>;
+};
+
+type IngestStats = {
+    blocks: number;
+    headings: number;
+    references: number;
+    tables: number;
+    figures: number;
+    paragraphs: number;
+    equations: number;
+};
+
+type IngestResponse = {
+    job_id: string;
+    document: StructuredDocument;
+    stats: IngestStats;
+};
+
+type RulesetName = "mjcet" | "uitm" | "gading";
+
+// Fallback labels shown before the API responds
+const RULESET_LABELS_DEFAULT: Record<RulesetName, string> = {
+    mjcet: "MJCET — Malaysian Journal of Chemical Engineering & Tech",
+    uitm: "UiTM / GADING — Social Sciences (v2)",
+    gading: "GADING legacy ruleset",
+};
+
+const STORAGE_KEY = "stylelock_session";
+
+// ------------ Component ------------
 
 export default function FormatterPage() {
-    const [manuscript, setManuscript] = useState<File | null>(null);
-    const [template, setTemplate] = useState<File | null>(null);
-    const [useSystemTemplate, setUseSystemTemplate] = useState(true);
-    const [processing, setProcessing] = useState(false);
-    const [result, setResult] = useState<{ job_id: string; formatted_url: string; report_url: string; review_url: string } | null>(null);
-    const [reviewData, setReviewData] = useState<{ original: any[]; formatted: any[]; mapping?: number[] } | null>(null);
-    const [syncing, setSyncing] = useState(false);
-    const [rightPaneMode, setRightPaneMode] = useState<'output' | 'reference'>('output');
-    const [referenceData, setReferenceData] = useState<any[] | null>(null);
-    const [styleOverrides, setStyleOverrides] = useState<Record<number, string>>({});
-    const [focusMode, setFocusMode] = useState(true);
+    const [file, setFile] = useState<File | null>(null);
+    const [jobId, setJobId] = useState<string | null>(null);
+    const [ingesting, setIngesting] = useState(false);
+    const [quickRendering, setQuickRendering] = useState<"docx" | "pdf" | "html" | null>(null);
+    const [rendering, setRendering] = useState<"docx" | "pdf" | "html" | null>(null);
+    const [doc, setDoc] = useState<StructuredDocument | null>(null);
+    const [stats, setStats] = useState<IngestStats | null>(null);
+    const [ruleset, setRuleset] = useState<RulesetName>("mjcet");
+    const [rulesetLabels, setRulesetLabels] = useState<Record<RulesetName, string>>(RULESET_LABELS_DEFAULT);
+    const [previewHtml, setPreviewHtml] = useState<string | null>(null);
+    const [error, setError] = useState<string | null>(null);
 
-    const availableStyles = [
-        "Title", "Author", "Affiliation", "Abs-Title", "Abstract", "Keywords",
-        "Heading A", "Heading B", "Heading C", "Main Text", "Reference",
-        "Caption B", "Equation", "Footnote"
-    ];
-
-    const fetchReference = async () => {
+    // ----- On mount: restore session + fetch live ruleset labels -----
+    useEffect(() => {
+        // Restore saved session from localStorage
         try {
-            const res = await fetch(`${API_URL}/template/reference`);
-            const data = await res.json();
-            if (Array.isArray(data)) {
-                setReferenceData(data);
-            } else {
-                setReferenceData([]);
+            const saved = localStorage.getItem(STORAGE_KEY);
+            if (saved) {
+                const { job_id, document, stats: savedStats } = JSON.parse(saved);
+                setJobId(job_id);
+                setDoc(document);
+                setStats(savedStats);
             }
-        } catch (e) {
-            setReferenceData([]);
-        }
-    };
-
-    // Get formatting properties for a specific style
-    const getStyleFormatting = (styleName: string) => {
-        const styleMap: Record<string, any> = {
-            "Title": { fontSize: '17pt', fontWeight: 'bold', textAlign: 'center', marginBottom: '12pt', marginTop: '0' },
-            "Author": { fontSize: '11pt', fontWeight: 'normal', textAlign: 'center', marginBottom: '0', marginTop: '0' },
-            "Affiliation": { fontSize: '10pt', fontStyle: 'italic', textAlign: 'center', marginBottom: '2pt', color: '#FF0000' },
-            "Abs-Title": { fontSize: '10pt', fontWeight: 'bold', marginBottom: '0', marginTop: '0' },
-            "Abstract": { fontSize: '10pt', textAlign: 'justify', marginBottom: '0', lineHeight: '1.0', fontStyle: 'italic' },
-            "Keywords": { fontSize: '10pt', marginBottom: '0' },
-            "Heading A": { fontSize: '10pt', fontWeight: 'bold', marginBottom: '0', marginTop: '0', lineHeight: '1.0' },
-            "Heading B": { fontSize: '10pt', fontWeight: 'bold', marginBottom: '0', marginTop: '0', lineHeight: '1.0', marginLeft: '18pt', textIndent: '-18pt' },
-            "Heading C": { fontSize: '10pt', fontStyle: 'italic', marginBottom: '0', marginTop: '0', lineHeight: '1.0' },
-            "Main Text": { fontSize: '10pt', textAlign: 'justify', marginBottom: '0', lineHeight: '1.0' },
-            "Reference": { fontSize: '10pt', textAlign: 'left', marginBottom: '0', lineHeight: '1.0', marginLeft: '18pt', textIndent: '-18pt' },
-            "Caption B": { fontSize: '9pt', marginBottom: '0', lineHeight: '1.0' },
-            "Equation": { fontSize: '10pt', textAlign: 'right', marginBottom: '0', marginTop: '0' },
-            "Footnote": { fontSize: '8pt', marginBottom: '0', lineHeight: '1.0' }
-        };
-
-        return styleMap[styleName] || { fontSize: '10pt', marginBottom: '0', lineHeight: '1.0' };
-    };
-
-    const handleUpload = async () => {
-        if (!manuscript || (!template && !useSystemTemplate)) return;
-        setProcessing(true);
-        setResult(null);
-        setReviewData(null);
-
-        const formData = new FormData();
-        formData.append("manuscript", manuscript);
-        if (!useSystemTemplate && template) {
-            formData.append("template", template);
+        } catch {
+            // ignore corrupt storage
         }
 
-        try {
-            const res = await fetch(`${API_URL}/transform?use_system_template=${useSystemTemplate}`, {
-                method: "POST",
-                body: formData,
-            });
-            const data = await res.json();
-            if (res.ok) {
-                setResult(data);
-                const reviewRes = await fetch(`${API_URL}/review/${data.job_id}`);
-                const rData = await reviewRes.json();
-                setReviewData(rData);
-            } else {
-                alert("Error: " + (data.detail || "Transformation failed"));
+        // Fetch live labels from the API in parallel
+        const names: RulesetName[] = ["mjcet", "uitm", "gading"];
+        Promise.all(
+            names.map((name) =>
+                fetch(`${API_URL}/render/ruleset?ruleset_name=${name}`)
+                    .then((r) => r.json())
+                    .then((data) => [name, data] as [RulesetName, Record<string, unknown>])
+                    .catch(() => [name, null] as [RulesetName, null])
+            )
+        ).then((results) => {
+            const labels: Partial<Record<RulesetName, string>> = {};
+            for (const [name, data] of results) {
+                if (!data) continue;
+                const j = data.journal as Record<string, string> | undefined;
+                if (j?.short_name && j?.name) {
+                    labels[name] = `${j.short_name} — ${j.name}`;
+                } else if (typeof data.ruleset_name === "string") {
+                    labels[name] = data.ruleset_name;
+                }
             }
-        } catch (e) {
-            alert("Processing failed. Make sure the backend is running.");
+            setRulesetLabels((prev) => ({ ...prev, ...labels }));
+        });
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // ----- Persist session to localStorage whenever doc changes -----
+    useEffect(() => {
+        if (doc && jobId && stats) {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify({ job_id: jobId, document: doc, stats }));
+            } catch {
+                // storage quota exceeded — skip silently
+            }
+        }
+    }, [doc, jobId, stats]);
+
+    // ----- Ingest (parse .docx → StructuredDocument) -----
+    const handleIngest = async () => {
+        if (!file) return;
+        setIngesting(true);
+        setError(null);
+        setPreviewHtml(null);
+        try {
+            const fd = new FormData();
+            fd.append("manuscript", file);
+            const res = await fetch(`${API_URL}/ingest`, { method: "POST", body: fd });
+            if (!res.ok) {
+                const j = await res.json().catch(() => ({}));
+                throw new Error(j.detail || `Ingest failed (${res.status})`);
+            }
+            const data: IngestResponse = await res.json();
+            setJobId(data.job_id);
+            setDoc(data.document);
+            setStats(data.stats);
+        } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e));
         } finally {
-            setProcessing(false);
+            setIngesting(false);
         }
     };
 
-    const handleSync = async () => {
-        if (!result?.job_id || !reviewData?.original) return;
-        setSyncing(true);
+    // ----- Quick reformat (ingest + render in one shot) -----
+    const handleQuickRender = async (kind: "docx" | "pdf" | "html") => {
+        if (!file) return;
+        setQuickRendering(kind);
+        setError(null);
         try {
-            // Collect text for EVERY original paragraph, preserving hidden ones
-            const paras = reviewData.original.map((para, i) => {
-                const el = document.getElementById(`para-editor-${i}`);
-                // Use DOM text if editable, otherwise current para text
-                return el ? el.textContent : (para.text || "");
-            });
+            const fd = new FormData();
+            fd.append("manuscript", file);
+            const res = await fetch(
+                `${API_URL}/ingest-and-render/${kind}?ruleset_name=${ruleset}`,
+                { method: "POST", body: fd }
+            );
+            if (!res.ok) {
+                const j = await res.json().catch(() => ({}));
+                throw new Error(j.detail || `Quick render failed (${res.status})`);
+            }
+            if (kind === "html") {
+                const html = await res.text();
+                const blob = new Blob([html], { type: "text/html" });
+                const url = URL.createObjectURL(blob);
+                window.open(url, "_blank");
+                URL.revokeObjectURL(url);
+            } else {
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `document.${kind}`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            }
+        } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setQuickRendering(null);
+        }
+    };
 
-            const res = await fetch(`${API_URL}/update/${result.job_id}`, {
+    // ----- Render from editor -----
+    const handleRender = async (kind: "docx" | "pdf" | "html") => {
+        if (!doc) return;
+        setRendering(kind);
+        setError(null);
+        try {
+            const res = await fetch(`${API_URL}/render/${kind}`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    manuscript_text: paras,
-                    overrides: styleOverrides
-                }),
+                body: JSON.stringify({ document: doc, ruleset_name: ruleset, use_template: true }),
             });
-            const data = await res.json();
-            if (res.ok) {
-                setReviewData(data);
-                alert("Sync complete! Result preview updated.");
+            if (!res.ok) {
+                const j = await res.json().catch(() => ({}));
+                throw new Error(j.detail || `Render failed (${res.status})`);
             }
-        } catch (e) {
-            alert("Sync failed.");
+            if (kind === "html") {
+                const html = await res.text();
+                setPreviewHtml(html);
+            } else {
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `document.${kind}`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            }
+        } catch (e: unknown) {
+            setError(e instanceof Error ? e.message : String(e));
         } finally {
-            setSyncing(false);
+            setRendering(null);
         }
     };
 
-    if (reviewData) {
-        return (
-            <div className="min-h-screen w-full bg-[#0f172a] text-white font-['Plus_Jakarta_Sans',sans-serif] flex flex-col p-4 overflow-hidden bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-blue-900 via-slate-900 to-black">
-                {/* Header */}
-                <div className="flex justify-between items-center mb-4 px-2">
-                    <div className="flex items-center gap-3">
-                        <Link href="/">
-                            <div className="w-10 h-10 bg-[#0066cc] rounded-lg flex items-center justify-center shadow-lg shadow-blue-500/20">
-                                <span className="text-white font-black text-xl">W</span>
-                            </div>
-                        </Link>
-                        <div>
-                            <h1 className="text-xl font-bold text-white">
-                                StyleLock <span className="text-white/40 font-normal">| GADING Editor</span>
-                            </h1>
-                            <div className="text-[10px] text-[#ff6b35] font-medium -mt-1 uppercase tracking-widest">Enterprise Formatting Suite</div>
-                        </div>
-                    </div>
-                    <div className="flex gap-2">
-                        <button onClick={() => setReviewData(null)} className="px-3 py-1.5 text-xs font-bold text-white/60 hover:bg-white/10 rounded-md transition border border-white/10 hover:text-white">
-                            Close Document
-                        </button>
-                    </div>
-                </div>
+    const reset = () => {
+        setDoc(null);
+        setStats(null);
+        setPreviewHtml(null);
+        setError(null);
+        setFile(null);
+        setJobId(null);
+        try { localStorage.removeItem(STORAGE_KEY); } catch { /* ignore */ }
+    };
 
-                {/* Side-by-Side Grid */}
-                <div className="flex-1 grid grid-cols-2 gap-6 h-0 min-h-0">
+    // ----- Mutators -----
+    const setMeta = <K extends keyof DocumentMetadata>(key: K, value: DocumentMetadata[K]) => {
+        if (!doc) return;
+        setDoc({ ...doc, metadata: { ...doc.metadata, [key]: value } });
+    };
 
-                    {/* LEFT: Word Editor (Dark Glass) */}
-                    <div className="flex flex-col rounded-2xl overflow-hidden shadow-2xl border border-white/10 bg-[rgba(12,18,35,0.8)] backdrop-blur-[20px]">
-                        {/* Header */}
-                        <div className="bg-black/20 border-b border-white/10 px-4 py-3 flex items-center justify-between">
-                            <span className="text-[11px] font-black text-white/70 uppercase tracking-widest">1. Source Editor (Your Content)</span>
-                            <span className="text-[9px] text-white/40 font-medium">Verify categorization here</span>
-                        </div>
-                        {/* Ribbon */}
-                        <div className="bg-black/10 border-b border-white/10">
-                            <div className="bg-white/5 p-2 flex items-center justify-between border-b border-white/10 shadow-sm">
-                                <div className="flex items-center gap-1 text-white">
-                                    <div className="flex border-r border-white/10 pr-2 mr-2 gap-0.5">
-                                        <button onClick={() => document.execCommand('bold')} className="p-1.5 hover:bg-white/10 rounded transition font-bold w-8 h-8 flex items-center justify-center">B</button>
-                                        <button onClick={() => document.execCommand('italic')} className="p-1.5 hover:bg-white/10 rounded transition italic w-8 h-8 flex items-center justify-center">I</button>
-                                        <button onClick={() => document.execCommand('underline')} className="p-1.5 hover:bg-white/10 rounded transition underline w-8 h-8 flex items-center justify-center">U</button>
-                                    </div>
-                                    <div className="flex border-r border-white/10 pr-2 mr-2 gap-2">
-                                        <button
-                                            onClick={() => setFocusMode(!focusMode)}
-                                            className={`px-2 py-1 rounded text-[9px] font-bold uppercase transition-all flex items-center gap-1 ${focusMode ? 'bg-[#ff6b35] text-white shadow-lg shadow-orange-500/20' : 'bg-white/5 text-white/40 hover:text-white border border-white/10'}`}
-                                            title={focusMode ? "Show all elements" : "Focus on paragraphs only"}
-                                        >
-                                            <span className="text-xs">{focusMode ? "★" : "☆"}</span>
-                                            {focusMode ? "Focus Active" : "Focus Mode"}
-                                        </button>
-                                    </div>
-                                    <div className="flex items-center gap-0.5 text-white/80">
-                                        <button onClick={() => document.execCommand('justifyLeft')} className="p-1.5 hover:bg-white/10 rounded transition w-8 h-8 flex items-center justify-center text-lg leading-none">≡</button>
-                                        <button onClick={() => document.execCommand('justifyCenter')} className="p-1.5 hover:bg-white/10 rounded transition w-8 h-8 flex items-center justify-center text-lg leading-none">≂</button>
-                                        <button onClick={() => document.execCommand('justifyFull')} className="p-1.5 hover:bg-white/10 rounded transition w-8 h-8 flex items-center justify-center text-lg leading-none">≣</button>
-                                    </div>
-                                </div>
-                                <div className="flex gap-2">
-                                    <button onClick={handleSync} disabled={syncing} className="px-4 py-1.5 bg-[#0066cc] hover:bg-[#0052a3] text-white rounded-md text-[11px] font-bold transition shadow-sm active:scale-95 disabled:opacity-50">
-                                        {syncing ? "Syncing..." : "Sync & Format"}
-                                    </button>
-                                    <a href={`${API_URL}${result?.formatted_url}`} className="px-4 py-1.5 bg-[#7c3aed] hover:bg-[#6d28d9] text-white rounded-md text-[11px] font-bold transition shadow-sm" download>
-                                        Download
-                                    </a>
-                                </div>
-                            </div>
-                        </div>
+    const updateBlock = (idx: number, patch: Partial<Block>) => {
+        if (!doc) return;
+        const blocks = [...doc.blocks];
+        blocks[idx] = { ...blocks[idx], ...patch } as Block;
+        setDoc({ ...doc, blocks });
+    };
 
-                        {/* Ruler */}
-                        <div className="h-6 bg-black/20 border-b border-white/10 flex items-end px-[2.5cm] relative">
-                            <div className="flex-1 h-2 border-l border-r border-white/20 flex justify-between px-2 text-[8px] text-white/30">
-                                <span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span>
-                            </div>
-                        </div>
+    const deleteBlock = (idx: number) => {
+        if (!doc) return;
+        const blocks = doc.blocks.filter((_, i) => i !== idx);
+        setDoc({ ...doc, blocks });
+    };
 
-                        {/* Paper Container */}
-                        <div className="flex-1 overflow-y-auto bg-black/40 p-8 flex flex-col items-center">
-                            {/* A4 Pages */}
-                            <div className="w-[21cm] bg-white shadow-xl mb-8 text-black font-serif relative" style={{ padding: '2.54cm', minHeight: '29.7cm' }}>
-                                {Array.isArray(reviewData?.original) && reviewData.original.map((para, i) => (
-                                    <div key={i} className="group relative mb-6" style={{ breakInside: 'avoid', pageBreakInside: 'avoid' }}>
-                                        <div className="flex items-center gap-2 mb-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            <select
-                                                value={styleOverrides[i] || para.style || "Main Text"}
-                                                onChange={(e) => setStyleOverrides(prev => ({ ...prev, [i]: e.target.value }))}
-                                                className="bg-[#0066cc]/10 text-[#0066cc] text-[9px] font-bold px-2 py-0.5 rounded border border-[#0066cc]/30 outline-none focus:ring-1 focus:ring-[#0066cc] cursor-pointer appearance-none uppercase"
-                                            >
-                                                {availableStyles.map(s => <option key={s} value={s}>{s}</option>)}
-                                            </select>
-                                            <div className="h-[1px] flex-1 bg-[#0066cc]/20"></div>
-                                        </div>
-                                        {para.style === "Table Placeholder" ? (
-                                            !focusMode && (
-                                                <div className="w-full my-4 bg-slate-50 border border-slate-300 rounded overflow-hidden">
-                                                    <div className="bg-slate-100 p-2 border-b border-slate-200 flex justify-between items-center text-[10px] text-slate-500 font-sans select-none">
-                                                        <span className="font-bold flex items-center gap-1">📊 TABLE PREVIEW ({para.props.rows} Rows)</span>
-                                                        <span className="italic">Standard formatting enforced in download</span>
-                                                    </div>
-                                                    <div className="overflow-x-auto p-2">
-                                                        {para.props.table_data ? (
-                                                            <table className="min-w-full border-collapse border border-slate-300 bg-white text-[9px] font-serif leading-none">
-                                                                <tbody>
-                                                                    {para.props.table_data.map((row: string[], rIndex: number) => (
-                                                                        <tr key={rIndex}>
-                                                                            {row.map((cell: string, cIndex: number) => (
-                                                                                <td key={cIndex} className="border border-slate-300 p-1 align-top text-black">
-                                                                                    {cell}
-                                                                                </td>
-                                                                            ))}
-                                                                        </tr>
-                                                                    ))}
-                                                                </tbody>
-                                                            </table>
-                                                        ) : (
-                                                            <div className="text-center text-slate-400 text-xs py-4">No preview data available</div>
-                                                        )}
-                                                    </div>
-                                                </div>
-                                            )
-                                        ) : focusMode && (para.style === "Image Placeholder") ? null : (
-                                            <div
-                                                id={`para-editor-${i}`}
-                                                contentEditable
-                                                suppressContentEditableWarning={true}
-                                                className="manuscript-para outline-none focus:ring-1 focus:ring-blue-100 p-1 rounded transition leading-normal text-[11pt]"
-                                                style={{ fontFamily: "'Times New Roman', serif" }}
-                                            >
-                                                {para.text}
-                                            </div>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    </div>
-
-                    {/* RIGHT: Compliant Preview (Glass) */}
-                    <div className="flex flex-col rounded-2xl overflow-hidden shadow-2xl border border-white/10 bg-[rgba(12,18,35,0.8)] backdrop-blur-[20px]">
-                        <div className="p-2 border-b border-white/10 bg-black/20 flex items-center justify-between z-10">
-                            <div className="flex bg-black/40 rounded-lg p-1 scale-90 origin-left">
-                                <button onClick={() => setRightPaneMode('output')} className={`px-3 py-1.5 rounded-md text-[10px] font-bold uppercase transition-all ${rightPaneMode === 'output' ? 'bg-[#7c3aed] text-white shadow-lg' : 'text-white/40 hover:text-white'}`}>
-                                    Final Result
-                                </button>
-                                <button onClick={() => { setRightPaneMode('reference'); fetchReference(); }} className={`px-3 py-1.5 rounded-md text-[10px] font-bold uppercase transition-all ${rightPaneMode === 'reference' ? 'bg-[#0066cc] text-white shadow-lg' : 'text-white/40 hover:text-white'}`}>
-                                    GADING Guide
-                                </button>
-                            </div>
-                            <span className={`text-[10px] font-bold uppercase tracking-wider ${rightPaneMode === 'output' ? 'text-[#7c3aed]' : 'text-[#0066cc]'} pr-3`}>
-                                {rightPaneMode === 'output' ? '2. Final Preview' : 'Reference Guide'}
-                            </span>
-                        </div>
-
-                        <div className="flex-1 overflow-y-auto bg-black/40 p-8 flex flex-col items-center">
-                            {/* A4 Pages */}
-                            <div className="w-[21cm] bg-white shadow-xl mb-8 text-black font-serif relative" style={{ padding: '2.54cm', minHeight: '29.7cm' }}>
-                                {/* Header from template */}
-                                <div className="w-full border-b border-slate-200 pb-4 mb-12">
-                                    <table className="w-full" style={{ fontFamily: "'Times New Roman', serif" }}>
-                                        <tbody>
-                                            <tr>
-                                                <td className="align-middle text-center" style={{ width: '30%' }}>
-                                                    <img src="/image2.png" alt="GADING Logo" className="inline-block" style={{ width: '120px', height: 'auto' }} />
-                                                    <div className="text-[6pt] mt-1">e-ISSN: 2600-7568</div>
-                                                </td>
-                                                <td className="align-top text-center" style={{ width: '40%' }}>
-                                                    <div className="text-[7pt]">Available online at https://gadingssuitm.com/index.php/gadingss</div>
-                                                </td>
-                                                <td className="align-middle text-center border-t border-b border-black" style={{ width: '30%' }}>
-                                                    <div className="text-[12pt] font-bold" style={{ fontFamily: "'Arial Narrow', Arial, sans-serif" }}>GADING Journal for the Social Sciences</div>
-                                                </td>
-                                            </tr>
-                                        </tbody>
-                                    </table>
-                                </div>
-
-
-                                {rightPaneMode === 'reference' && !referenceData ? (
-                                    <div className="flex items-center justify-center py-20 italic text-slate-400 font-sans">Loading GADING Guide...</div>
-                                ) : (
-                                    (rightPaneMode === 'output' ? (reviewData?.formatted || []) : (referenceData || [])).map((para: any, i: number) => {
-                                        // MAPPING LOGIC
-                                        const originalIndex = (rightPaneMode === 'output' && reviewData?.mapping)
-                                            ? reviewData.mapping[i]
-                                            : -1;
-
-                                        // Style Lookup
-                                        const currentStyle = (originalIndex !== -1 && styleOverrides[originalIndex])
-                                            ? styleOverrides[originalIndex]
-                                            : para.style;
-
-                                        return (
-                                            <div key={i} className="group relative mb-4" style={{ breakInside: 'avoid', pageBreakInside: 'avoid' }}>
-                                                <div className="flex items-center gap-2 mb-1">
-                                                    {rightPaneMode === 'output' ? (
-                                                        <select
-                                                            value={currentStyle}
-                                                            onChange={(e) => {
-                                                                if (originalIndex !== -1) {
-                                                                    setStyleOverrides(prev => ({ ...prev, [originalIndex]: e.target.value }));
-                                                                }
-                                                            }}
-                                                            disabled={originalIndex === -1}
-                                                            className={`bg-emerald-100 text-emerald-800 text-[8px] font-bold px-1.5 py-0.5 rounded outline-none focus:ring-1 focus:ring-emerald-500 uppercase cursor-pointer appearance-none ${originalIndex === -1 ? 'opacity-50 cursor-not-allowed' : ''}`}
-                                                            title={originalIndex === -1 ? "Template-generated content (cannot change style)" : `Mapped to Source ¶${originalIndex + 1}`}
-                                                        >
-                                                            {availableStyles.map(s => <option key={s} value={s}>{s}</option>)}
-                                                        </select>
-                                                    ) : (
-                                                        <span className="bg-blue-100 text-blue-800 text-[8px] font-bold px-1.5 py-0.5 rounded uppercase select-none">{para.style}</span>
-                                                    )}
-                                                    <div className={`h-[1px] flex-1 ${rightPaneMode === 'output' ? 'bg-emerald-100' : 'bg-blue-100'} opacity-30`}></div>
-                                                </div>
-                                                {para.style === "Table Placeholder" ? (
-                                                    <div className="w-full my-4 bg-white border border-slate-200 shadow-sm">
-                                                        {para.props.table_data ? (
-                                                            <table className="w-full border-collapse border border-black text-[8pt] font-serif leading-none">
-                                                                <tbody>
-                                                                    <tr className="border-b border-black">
-                                                                        {para.props.table_data[0]?.map((header: string, hIndex: number) => (
-                                                                            <td key={hIndex} className="p-1 font-bold text-center border-b border-black">{header}</td>
-                                                                        ))}
-                                                                    </tr>
-                                                                    {para.props.table_data.slice(1).map((row: string[], rIndex: number) => (
-                                                                        <tr key={rIndex} className="border-b border-slate-200 last:border-black">
-                                                                            {row.map((cell: string, cIndex: number) => (
-                                                                                <td key={cIndex} className="p-1 text-left align-top">{cell}</td>
-                                                                            ))}
-                                                                        </tr>
-                                                                    ))}
-                                                                </tbody>
-                                                            </table>
-                                                        ) : (
-                                                            <div className="text-center text-[9pt] italic py-2">Table Data Placeholder</div>
-                                                        )}
-                                                        <div className="bg-slate-50 text-[7pt] text-center text-slate-400 py-1">Table formatted to APA 7th Style (Horizontal Lines Only)</div>
-                                                    </div>
-                                                ) : para.style === "Image Placeholder" ? (
-                                                    <div className="w-full my-6 bg-slate-50 border-2 border-dashed border-slate-300 rounded-lg flex flex-col items-center justify-center py-8 px-4 select-none">
-                                                        <div className="w-12 h-12 mb-2 opacity-20 bg-slate-900 mask-image">🖼️</div>
-                                                        <span className="text-[10pt] font-bold text-slate-500 font-serif italic">Image Preserved</span>
-                                                        <span className="text-[8pt] text-slate-400 mt-1">Content retained in final output</span>
-                                                    </div>
-                                                ) : (
-                                                    <p
-                                                        className="text-black"
-                                                        style={{
-                                                            fontFamily: "'Times New Roman', serif",
-                                                            ...getStyleFormatting(currentStyle),
-                                                        }}
-                                                    >
-                                                        {para.text}
-                                                    </p>
-                                                )}
-                                            </div>
-                                        )
-                                    })
-                                )
-                                }
-                                <div className="mt-20 pt-4 border-t border-slate-200 text-center text-[8pt] text-slate-400 italic">
-                                    Copyright © GADING Journal. All rights reserved.
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                </div>
-
-                {/* Status Bar */}
-                <div className="h-6 mt-4 flex items-center justify-between px-4 bg-[#ff6b35] text-white text-[10px] font-medium rounded-md shadow-inner shrink-0">
-                    <div className="flex gap-4">
-                        <span>Page 1 of 1</span>
-                        <span>{reviewData?.original?.length || 0} Paragraphs</span>
-                        <span className="opacity-70">English (United States)</span>
-                    </div>
-                    <div className="flex gap-4 items-center">
-                        <span className="flex items-center gap-1">
-                            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                            Connected to GADING Engine
-                        </span>
-                        <span>100% Zoom</span>
-                    </div>
-                </div>
-            </div>
-        );
-    }
+    const moveBlock = (idx: number, dir: -1 | 1) => {
+        if (!doc) return;
+        const target = idx + dir;
+        if (target < 0 || target >= doc.blocks.length) return;
+        const blocks = [...doc.blocks];
+        [blocks[idx], blocks[target]] = [blocks[target], blocks[idx]];
+        setDoc({ ...doc, blocks });
+    };
 
     return (
-        <div className="min-h-screen bg-[#0f172a] text-white flex flex-col items-center justify-center p-6 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-blue-900 via-slate-900 to-black">
-            {/* Header with Back Button */}
-            <div className="absolute top-8 left-8">
-                <a href="/" className="text-slate-400 hover:text-white text-sm font-bold transition">
-                    &larr; Back to Home
-                </a>
-            </div>
+        <div className="min-h-screen w-full bg-[#0f172a] text-white font-['Plus_Jakarta_Sans',sans-serif] flex flex-col p-4 bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-blue-900 via-slate-900 to-black">
+            <Header
+                hasDoc={!!doc}
+                ruleset={ruleset}
+                rulesetLabels={rulesetLabels}
+                setRuleset={setRuleset}
+                onReset={reset}
+            />
 
-            <div className="max-w-2xl w-full space-y-8 bg-white/5 backdrop-blur-xl p-8 rounded-3xl border border-white/10 shadow-2xl">
-                <div className="text-center relative">
-                    <h1 className="text-4xl font-extrabold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400">
-                        StyleLock
+            {error && (
+                <div className="mx-2 mb-3 px-4 py-2 rounded-md bg-red-500/15 border border-red-500/40 text-red-200 text-sm">
+                    {error}
+                </div>
+            )}
+
+            {!doc ? (
+                <UploadCard
+                    file={file}
+                    setFile={setFile}
+                    ruleset={ruleset}
+                    onIngest={handleIngest}
+                    ingesting={ingesting}
+                    onQuickRender={handleQuickRender}
+                    quickRendering={quickRendering}
+                />
+            ) : (
+                <EditorView
+                    doc={doc}
+                    stats={stats}
+                    previewHtml={previewHtml}
+                    rendering={rendering}
+                    onRender={handleRender}
+                    setMeta={setMeta}
+                    updateBlock={updateBlock}
+                    deleteBlock={deleteBlock}
+                    moveBlock={moveBlock}
+                />
+            )}
+        </div>
+    );
+}
+
+// ------------ Header ------------
+
+function Header(props: {
+    hasDoc: boolean;
+    ruleset: RulesetName;
+    rulesetLabels: Record<RulesetName, string>;
+    setRuleset: (r: RulesetName) => void;
+    onReset: () => void;
+}) {
+    return (
+        <div className="flex justify-between items-center mb-4 px-2 shrink-0">
+            <div className="flex items-center gap-3">
+                <Link href="/">
+                    <div className="w-10 h-10 bg-[#0066cc] rounded-lg flex items-center justify-center shadow-lg shadow-blue-500/20">
+                        <span className="text-white font-black text-xl">S</span>
+                    </div>
+                </Link>
+                <div>
+                    <h1 className="text-xl font-bold text-white">
+                        StyleLock <span className="text-white/40 font-normal">| SciSpace Editor</span>
                     </h1>
-                    <p className="mt-2 text-slate-400 font-medium">GADING Journal DOCX Formatting System</p>
+                    <div className="text-[10px] text-[#ff6b35] font-medium -mt-1 uppercase tracking-widest">
+                        Structured editorial pipeline
+                    </div>
                 </div>
-
-                <div className="space-y-6">
-                    <div className="flex p-1 bg-slate-900/50 rounded-xl border border-white/5">
-                        <button
-                            onClick={() => setUseSystemTemplate(true)}
-                            className={`flex-1 py-2 px-4 rounded-lg text-sm font-bold transition-all ${useSystemTemplate ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-200'}`}
-                        >
-                            System GADING Template
-                        </button>
-                        <button
-                            onClick={() => setUseSystemTemplate(false)}
-                            className={`flex-1 py-2 px-4 rounded-lg text-sm font-bold transition-all ${!useSystemTemplate ? 'bg-blue-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-200'}`}
-                        >
-                            Manual Template
-                        </button>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div className={`p-6 rounded-2xl border-2 border-dashed transition-all ${manuscript ? 'border-emerald-500/50 bg-emerald-500/5' : 'border-slate-700 hover:border-blue-500/50'}`}>
-                            <label className="block text-center cursor-pointer">
-                                <span className="block text-sm font-semibold text-slate-300 mb-2">Manuscript</span>
-                                <input type="file" className="hidden" onChange={(e) => setManuscript(e.target.files?.[0] || null)} />
-                                <span className="text-xs text-slate-500 truncate block">
-                                    {manuscript ? manuscript.name : "Select author submission"}
-                                </span>
-                            </label>
-                        </div>
-                        <div className={`p-6 rounded-2xl border-2 border-dashed transition-all ${useSystemTemplate ? 'opacity-50 border-slate-800' : (template ? 'border-emerald-500/50 bg-emerald-500/5' : 'border-slate-700 hover:border-blue-500/50')}`}>
-                            <label className={`block text-center ${useSystemTemplate ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
-                                <span className="block text-sm font-semibold text-slate-300 mb-2">Journal Template</span>
-                                <input
-                                    type="file"
-                                    className="hidden"
-                                    disabled={useSystemTemplate}
-                                    onChange={(e) => setTemplate(e.target.files?.[0] || null)}
-                                />
-                                <span className="text-xs text-slate-500 truncate block">
-                                    {useSystemTemplate ? "Using default GADING template" : (template ? template.name : "Select UiTM template")}
-                                </span>
-                            </label>
-                        </div>
-                    </div>
-
-                    <button
-                        onClick={handleUpload}
-                        disabled={processing || !manuscript || (!template && !useSystemTemplate)}
-                        className="w-full py-4 rounded-xl bg-gradient-to-r from-blue-600 to-emerald-600 font-bold hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 shadow-lg shadow-blue-500/20"
+            </div>
+            <div className="flex items-center gap-3">
+                <div className="flex items-center gap-2 px-3 py-1.5 bg-white/5 border border-white/10 rounded-lg">
+                    <span className="text-[10px] uppercase tracking-wider text-white/40 font-bold">Template</span>
+                    <select
+                        value={props.ruleset}
+                        onChange={(e) => props.setRuleset(e.target.value as RulesetName)}
+                        className="bg-transparent text-xs font-bold text-white outline-none cursor-pointer"
                     >
-                        {processing ? (
-                            <span className="flex items-center justify-center gap-2">
-                                <div className="w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-                                Processing Manuscript...
-                            </span>
-                        ) : "Transform Document"}
+                        {(Object.keys(props.rulesetLabels) as RulesetName[]).map((k) => (
+                            <option key={k} value={k} className="text-black">
+                                {props.rulesetLabels[k]}
+                            </option>
+                        ))}
+                    </select>
+                </div>
+                {props.hasDoc && (
+                    <button
+                        onClick={props.onReset}
+                        className="px-3 py-1.5 text-xs font-bold text-white/60 hover:bg-white/10 rounded-md transition border border-white/10 hover:text-white"
+                    >
+                        New document
                     </button>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// ------------ Upload card (initial state) ------------
+
+function UploadCard(props: {
+    file: File | null;
+    setFile: (f: File | null) => void;
+    ruleset: RulesetName;
+    onIngest: () => void;
+    ingesting: boolean;
+    onQuickRender: (kind: "docx" | "pdf" | "html") => void;
+    quickRendering: "docx" | "pdf" | "html" | null;
+}) {
+    return (
+        <div className="flex-1 flex items-center justify-center">
+            <div className="max-w-2xl w-full space-y-6 bg-white/5 backdrop-blur-xl p-8 rounded-3xl border border-white/10 shadow-2xl">
+                <div className="text-center">
+                    <h2 className="text-3xl font-extrabold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-emerald-400">
+                        Ingest a manuscript
+                    </h2>
+                    <p className="mt-2 text-slate-400 text-sm">
+                        Upload your <code className="font-mono text-emerald-400">.docx</code> and we&apos;ll parse it into structured
+                        content. Then edit and render to DOCX, PDF, or HTML.
+                    </p>
                 </div>
 
-                {result && (
-                    <div className="mt-8 p-6 rounded-2xl bg-white/5 border border-white/10 animate-in fade-in slide-in-from-bottom-4 duration-500">
-                        <h2 className="text-lg font-bold mb-4 flex items-center gap-2">
-                            <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                            Processing Complete
-                        </h2>
-                        <div className="grid grid-cols-2 gap-4">
-                            <a href={`${API_URL}${result.formatted_url}`} className="flex items-center justify-center p-4 rounded-xl bg-slate-800 hover:bg-slate-700 border border-white/5" download>
-                                Download DOCX
-                            </a>
-                            <a href={`${API_URL}${result.report_url}`} className="flex items-center justify-center p-4 rounded-xl bg-slate-800 hover:bg-slate-700 border border-white/5" target="_blank" rel="noreferrer">
-                                View Audit Report
-                            </a>
+                <div
+                    className={`p-10 rounded-2xl border-2 border-dashed transition-all ${
+                        props.file
+                            ? "border-emerald-500/50 bg-emerald-500/5"
+                            : "border-slate-700 hover:border-blue-500/50"
+                    }`}
+                >
+                    <label className="block text-center cursor-pointer">
+                        <input
+                            type="file"
+                            accept=".docx"
+                            className="hidden"
+                            onChange={(e) => props.setFile(e.target.files?.[0] || null)}
+                        />
+                        <div className="text-5xl mb-3 opacity-50">📄</div>
+                        <div className="text-sm font-semibold text-slate-200">
+                            {props.file ? props.file.name : "Choose a .docx file"}
+                        </div>
+                        <div className="text-xs text-slate-500 mt-1">
+                            {props.file
+                                ? `${(props.file.size / 1024).toFixed(1)} KB`
+                                : "Click to browse or drag-and-drop"}
+                        </div>
+                    </label>
+                </div>
+
+                {/* Primary action: ingest → editor */}
+                <button
+                    onClick={props.onIngest}
+                    disabled={!props.file || props.ingesting || !!props.quickRendering}
+                    className="w-full py-4 rounded-xl bg-gradient-to-r from-blue-600 to-emerald-600 font-bold hover:scale-[1.02] active:scale-95 transition-all disabled:opacity-50 disabled:hover:scale-100 shadow-lg shadow-blue-500/20"
+                >
+                    {props.ingesting ? (
+                        <span className="flex items-center justify-center gap-2">
+                            <div className="w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                            Parsing...
+                        </span>
+                    ) : (
+                        "Ingest manuscript →  edit &amp; render"
+                    )}
+                </button>
+
+                {/* Quick reformat: skip the editor */}
+                {props.file && (
+                    <div className="space-y-2">
+                        <div className="text-[10px] uppercase tracking-widest text-white/30 font-bold text-center">
+                            — or quick reformat (skip editor) —
+                        </div>
+                        <div className="grid grid-cols-3 gap-2">
+                            {(["docx", "pdf", "html"] as const).map((kind) => {
+                                const busy = props.quickRendering === kind;
+                                const otherBusy = !!props.quickRendering && !busy;
+                                const colors: Record<string, string> = {
+                                    docx: "#7c3aed",
+                                    pdf: "#ff6b35",
+                                    html: "#0066cc",
+                                };
+                                return (
+                                    <button
+                                        key={kind}
+                                        onClick={() => props.onQuickRender(kind)}
+                                        disabled={busy || otherBusy || props.ingesting}
+                                        style={{ background: busy ? "#444" : colors[kind] }}
+                                        className="py-2.5 rounded-lg text-white text-xs font-bold transition active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed shadow-sm"
+                                    >
+                                        {busy ? (
+                                            <span className="flex items-center justify-center gap-1">
+                                                <div className="w-3 h-3 border border-white/20 border-t-white rounded-full animate-spin" />
+                                                {kind.toUpperCase()}
+                                            </span>
+                                        ) : (
+                                            `↓ ${kind.toUpperCase()}`
+                                        )}
+                                    </button>
+                                );
+                            })}
                         </div>
                     </div>
                 )}
+
+                <p className="text-center text-xs text-slate-500">
+                    Structured content stays the source of truth — DOCX, PDF, and HTML are all rendered from the
+                    same JSON.
+                </p>
+            </div>
+        </div>
+    );
+}
+
+// ------------ Editor + preview view ------------
+
+function EditorView(props: {
+    doc: StructuredDocument;
+    stats: IngestStats | null;
+    previewHtml: string | null;
+    rendering: "docx" | "pdf" | "html" | null;
+    onRender: (kind: "docx" | "pdf" | "html") => void;
+    setMeta: <K extends keyof DocumentMetadata>(key: K, value: DocumentMetadata[K]) => void;
+    updateBlock: (idx: number, patch: Partial<Block>) => void;
+    deleteBlock: (idx: number) => void;
+    moveBlock: (idx: number, dir: -1 | 1) => void;
+}) {
+    return (
+        <div className="flex-1 grid grid-cols-2 gap-6 h-0 min-h-0">
+            {/* LEFT — structured editor */}
+            <div className="flex flex-col rounded-2xl overflow-hidden shadow-2xl border border-white/10 bg-[rgba(12,18,35,0.8)] backdrop-blur-[20px]">
+                <div className="bg-black/20 border-b border-white/10 px-4 py-3 flex items-center justify-between">
+                    <span className="text-[11px] font-black text-white/70 uppercase tracking-widest">
+                        1. Structured content
+                    </span>
+                    {props.stats && (
+                        <span className="text-[10px] text-white/40 font-medium">
+                            {props.stats.blocks} blocks · {props.stats.headings} headings · {props.stats.references}{" "}
+                            references · {props.stats.tables} tables · {props.stats.figures} figures
+                        </span>
+                    )}
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-6 space-y-6">
+                    <MetadataEditor metadata={props.doc.metadata} setMeta={props.setMeta} />
+
+                    <div className="h-px bg-white/10" />
+
+                    <div>
+                        <div className="text-[10px] uppercase tracking-widest text-white/40 font-bold mb-3">
+                            Body blocks
+                        </div>
+                        <div className="space-y-3">
+                            {props.doc.blocks.map((b, i) => (
+                                <BlockEditor
+                                    key={i}
+                                    index={i}
+                                    block={b}
+                                    canMoveUp={i > 0}
+                                    canMoveDown={i < props.doc.blocks.length - 1}
+                                    onChange={(patch) => props.updateBlock(i, patch)}
+                                    onDelete={() => props.deleteBlock(i)}
+                                    onMove={(d) => props.moveBlock(i, d)}
+                                />
+                            ))}
+                            {props.doc.blocks.length === 0 && (
+                                <div className="text-center text-xs text-slate-500 py-6 italic">
+                                    No body blocks parsed.
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            <p className="mt-8 text-slate-500 text-xs text-center max-w-md">
-                This system enforces strict GADING Journal styling. <br />
-                Editorial discipline, predictability, and compliance are guaranteed.
-            </p>
+            {/* RIGHT — render targets + preview */}
+            <div className="flex flex-col rounded-2xl overflow-hidden shadow-2xl border border-white/10 bg-[rgba(12,18,35,0.8)] backdrop-blur-[20px]">
+                <div className="bg-black/20 border-b border-white/10 px-4 py-3 flex items-center justify-between">
+                    <span className="text-[11px] font-black text-white/70 uppercase tracking-widest">
+                        2. Render
+                    </span>
+                    <div className="flex gap-2">
+                        <RenderButton
+                            label="HTML preview"
+                            kind="html"
+                            color="#0066cc"
+                            rendering={props.rendering}
+                            onClick={() => props.onRender("html")}
+                        />
+                        <RenderButton
+                            label="DOCX"
+                            kind="docx"
+                            color="#7c3aed"
+                            rendering={props.rendering}
+                            onClick={() => props.onRender("docx")}
+                        />
+                        <RenderButton
+                            label="PDF"
+                            kind="pdf"
+                            color="#ff6b35"
+                            rendering={props.rendering}
+                            onClick={() => props.onRender("pdf")}
+                        />
+                    </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto bg-black/40 p-6">
+                    {props.previewHtml ? (
+                        <div className="bg-white rounded-md shadow-2xl overflow-hidden">
+                            <iframe
+                                title="HTML preview"
+                                srcDoc={props.previewHtml}
+                                className="w-full h-[calc(100vh-220px)] border-0"
+                            />
+                        </div>
+                    ) : (
+                        <EmptyPreview />
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function EmptyPreview() {
+    return (
+        <div className="h-full flex flex-col items-center justify-center text-center px-6 text-slate-400">
+            <div className="text-6xl mb-4 opacity-30">📑</div>
+            <div className="text-sm font-semibold text-slate-300">No preview yet</div>
+            <div className="text-xs text-slate-500 mt-2 max-w-sm">
+                Hit <span className="text-[#0066cc] font-bold">HTML preview</span> to see your document rendered
+                inline. Use <span className="text-[#7c3aed] font-bold">DOCX</span> or{" "}
+                <span className="text-[#ff6b35] font-bold">PDF</span> to download a file.
+            </div>
+        </div>
+    );
+}
+
+// ------------ Render button ------------
+
+function RenderButton(props: {
+    label: string;
+    kind: "html" | "docx" | "pdf";
+    color: string;
+    rendering: "docx" | "pdf" | "html" | null;
+    onClick: () => void;
+}) {
+    const busy = props.rendering === props.kind;
+    const otherBusy = props.rendering !== null && !busy;
+    return (
+        <button
+            onClick={props.onClick}
+            disabled={busy || otherBusy}
+            style={{ background: busy ? "#444" : props.color }}
+            className="px-3 py-1.5 text-white rounded-md text-[11px] font-bold transition shadow-sm active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+            {busy ? "Rendering..." : props.label}
+        </button>
+    );
+}
+
+// ------------ Metadata editor ------------
+
+function MetadataEditor(props: {
+    metadata: DocumentMetadata;
+    setMeta: <K extends keyof DocumentMetadata>(key: K, value: DocumentMetadata[K]) => void;
+}) {
+    const { metadata, setMeta } = props;
+
+    return (
+        <div className="space-y-3">
+            <div className="text-[10px] uppercase tracking-widest text-white/40 font-bold">Front matter</div>
+
+            <FieldText
+                label="Title"
+                value={metadata.title || ""}
+                onChange={(v) => setMeta("title", v)}
+                placeholder="Manuscript title"
+            />
+
+            <FieldList
+                label="Authors"
+                values={metadata.authors}
+                onChange={(arr) => setMeta("authors", arr)}
+                placeholder="One author byline per line"
+            />
+
+            <FieldList
+                label="Affiliations"
+                values={metadata.affiliations}
+                onChange={(arr) => setMeta("affiliations", arr)}
+                placeholder="One affiliation per line"
+            />
+
+            <FieldTextarea
+                label="Abstract"
+                value={metadata.abstract || ""}
+                onChange={(v) => setMeta("abstract", v)}
+                placeholder="≤300 words"
+                rows={5}
+            />
+
+            <FieldText
+                label="Keywords"
+                value={metadata.keywords || ""}
+                onChange={(v) => setMeta("keywords", v)}
+                placeholder="Comma-separated, up to 6"
+            />
+        </div>
+    );
+}
+
+function FieldText(props: { label: string; value: string; onChange: (v: string) => void; placeholder?: string }) {
+    return (
+        <label className="block">
+            <span className="text-[10px] font-bold text-white/50 uppercase tracking-wider">{props.label}</span>
+            <input
+                type="text"
+                value={props.value}
+                onChange={(e) => props.onChange(e.target.value)}
+                placeholder={props.placeholder}
+                className="mt-1 w-full bg-black/30 border border-white/10 rounded-md px-3 py-2 text-sm text-white placeholder-white/30 outline-none focus:border-blue-500/50 transition"
+            />
+        </label>
+    );
+}
+
+function FieldTextarea(props: {
+    label: string;
+    value: string;
+    onChange: (v: string) => void;
+    placeholder?: string;
+    rows?: number;
+}) {
+    return (
+        <label className="block">
+            <span className="text-[10px] font-bold text-white/50 uppercase tracking-wider">{props.label}</span>
+            <textarea
+                value={props.value}
+                onChange={(e) => props.onChange(e.target.value)}
+                placeholder={props.placeholder}
+                rows={props.rows || 4}
+                className="mt-1 w-full bg-black/30 border border-white/10 rounded-md px-3 py-2 text-sm text-white placeholder-white/30 outline-none focus:border-blue-500/50 transition resize-y font-serif leading-relaxed"
+            />
+        </label>
+    );
+}
+
+function FieldList(props: { label: string; values: string[]; onChange: (v: string[]) => void; placeholder?: string }) {
+    const text = useMemo(() => props.values.join("\n"), [props.values]);
+    return (
+        <label className="block">
+            <span className="text-[10px] font-bold text-white/50 uppercase tracking-wider">
+                {props.label} <span className="text-white/30">({props.values.length})</span>
+            </span>
+            <textarea
+                value={text}
+                onChange={(e) => props.onChange(e.target.value.split("\n").filter((l) => l.trim().length > 0))}
+                placeholder={props.placeholder}
+                rows={Math.max(props.values.length || 1, 1) + 1}
+                className="mt-1 w-full bg-black/30 border border-white/10 rounded-md px-3 py-2 text-sm text-white placeholder-white/30 outline-none focus:border-blue-500/50 transition resize-y"
+            />
+        </label>
+    );
+}
+
+// ------------ Block editors ------------
+
+const BLOCK_TYPE_LABELS: Record<Block["type"], string> = {
+    heading: "Heading",
+    paragraph: "Paragraph",
+    table: "Table",
+    figure: "Figure",
+    reference: "Reference",
+    equation: "Equation",
+};
+
+const BLOCK_TYPE_COLORS: Record<Block["type"], string> = {
+    heading: "#0066cc",
+    paragraph: "#475569",
+    table: "#7c3aed",
+    figure: "#ec4899",
+    reference: "#10b981",
+    equation: "#f59e0b",
+};
+
+function BlockEditor(props: {
+    index: number;
+    block: Block;
+    canMoveUp: boolean;
+    canMoveDown: boolean;
+    onChange: (patch: Partial<Block>) => void;
+    onDelete: () => void;
+    onMove: (dir: -1 | 1) => void;
+}) {
+    const { block } = props;
+    const color = BLOCK_TYPE_COLORS[block.type];
+
+    return (
+        <div className="group rounded-lg border border-white/10 bg-black/30 overflow-hidden">
+            <div
+                className="flex items-center justify-between px-3 py-1.5 border-b border-white/5"
+                style={{ background: `${color}15` }}
+            >
+                <div className="flex items-center gap-2">
+                    <span
+                        className="text-[9px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded"
+                        style={{ background: color, color: "white" }}
+                    >
+                        {BLOCK_TYPE_LABELS[block.type]}
+                        {block.type === "heading" ? ` ${block.level}` : ""}
+                    </span>
+                    {block.type === "heading" && (
+                        <select
+                            value={block.level}
+                            onChange={(e) => props.onChange({ level: e.target.value as "A" | "B" | "C" })}
+                            className="bg-transparent text-[10px] font-bold text-white/70 outline-none cursor-pointer"
+                        >
+                            <option value="A" className="text-black">Level A</option>
+                            <option value="B" className="text-black">Level B</option>
+                            <option value="C" className="text-black">Level C</option>
+                        </select>
+                    )}
+                    {block.type === "paragraph" && (
+                        <select
+                            value={block.style || "Main Text"}
+                            onChange={(e) => props.onChange({ style: e.target.value })}
+                            className="bg-transparent text-[10px] font-bold text-white/70 outline-none cursor-pointer"
+                        >
+                            {["Main Text", "Abstract", "Footnote", "Caption", "Source"].map((s) => (
+                                <option key={s} value={s} className="text-black">{s}</option>
+                            ))}
+                        </select>
+                    )}
+                </div>
+                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button
+                        onClick={() => props.onMove(-1)}
+                        disabled={!props.canMoveUp}
+                        className="text-white/40 hover:text-white text-xs px-1.5 py-0.5 rounded hover:bg-white/10 disabled:opacity-20 disabled:hover:bg-transparent"
+                        title="Move up"
+                    >
+                        ↑
+                    </button>
+                    <button
+                        onClick={() => props.onMove(1)}
+                        disabled={!props.canMoveDown}
+                        className="text-white/40 hover:text-white text-xs px-1.5 py-0.5 rounded hover:bg-white/10 disabled:opacity-20 disabled:hover:bg-transparent"
+                        title="Move down"
+                    >
+                        ↓
+                    </button>
+                    <button
+                        onClick={props.onDelete}
+                        className="text-white/40 hover:text-red-400 text-xs px-1.5 py-0.5 rounded hover:bg-red-500/10"
+                        title="Delete"
+                    >
+                        ✕
+                    </button>
+                </div>
+            </div>
+
+            <div className="p-3">
+                {block.type === "heading" && (
+                    <input
+                        type="text"
+                        value={block.text}
+                        onChange={(e) => props.onChange({ text: e.target.value })}
+                        className="w-full bg-transparent border-0 outline-none text-base font-bold text-white placeholder-white/30"
+                        placeholder="Heading text"
+                    />
+                )}
+
+                {block.type === "paragraph" && (
+                    <textarea
+                        value={block.text || ""}
+                        onChange={(e) => props.onChange({ text: e.target.value, runs: [] })}
+                        className="w-full bg-transparent border-0 outline-none text-sm text-white/90 font-serif leading-relaxed resize-y"
+                        rows={Math.max(2, Math.ceil((block.text?.length || 0) / 80))}
+                        placeholder="Paragraph text"
+                    />
+                )}
+
+                {block.type === "reference" && (
+                    <textarea
+                        value={block.raw}
+                        onChange={(e) => props.onChange({ raw: e.target.value, runs: [] })}
+                        className="w-full bg-transparent border-0 outline-none text-sm text-white/90 font-serif leading-relaxed resize-y"
+                        rows={Math.max(2, Math.ceil(block.raw.length / 80))}
+                        placeholder="APA 7 reference entry"
+                    />
+                )}
+
+                {block.type === "table" && <TableBlockEditor block={block} onChange={props.onChange} />}
+
+                {block.type === "figure" && (
+                    <div className="space-y-2">
+                        <input
+                            type="text"
+                            value={block.src || ""}
+                            onChange={(e) => props.onChange({ src: e.target.value })}
+                            placeholder="Image src (URL or filename)"
+                            className="w-full bg-black/30 border border-white/10 rounded px-2 py-1 text-xs text-white/80 outline-none focus:border-blue-500/50"
+                        />
+                        <input
+                            type="text"
+                            value={block.caption || ""}
+                            onChange={(e) => props.onChange({ caption: e.target.value })}
+                            placeholder="Caption (Fig. X. ...)"
+                            className="w-full bg-black/30 border border-white/10 rounded px-2 py-1 text-xs text-white/80 outline-none focus:border-blue-500/50"
+                        />
+                    </div>
+                )}
+
+                {block.type === "equation" && (
+                    <div className="space-y-2">
+                        <input
+                            type="text"
+                            value={block.latex || ""}
+                            onChange={(e) => props.onChange({ latex: e.target.value })}
+                            placeholder="LaTeX (optional)"
+                            className="w-full bg-black/30 border border-white/10 rounded px-2 py-1 text-xs text-white/80 outline-none focus:border-blue-500/50 font-mono"
+                        />
+                        <input
+                            type="text"
+                            value={block.text || ""}
+                            onChange={(e) => props.onChange({ text: e.target.value })}
+                            placeholder="Plain-text fallback"
+                            className="w-full bg-black/30 border border-white/10 rounded px-2 py-1 text-xs text-white/80 outline-none focus:border-blue-500/50"
+                        />
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function TableBlockEditor(props: {
+    block: TableBlock;
+    onChange: (patch: Partial<TableBlock>) => void;
+}) {
+    const { block, onChange } = props;
+    const header = block.header || [];
+    const rows = block.rows || [];
+
+    const updateHeader = (i: number, v: string) => {
+        const next = [...header];
+        next[i] = v;
+        onChange({ header: next });
+    };
+    const updateCell = (r: number, c: number, v: string) => {
+        const next = rows.map((row) => [...row]);
+        next[r][c] = v;
+        onChange({ rows: next });
+    };
+    const addRow = () => {
+        const cols = header.length || rows[0]?.length || 1;
+        onChange({ rows: [...rows, Array(cols).fill("")] });
+    };
+    const deleteRow = (r: number) => {
+        onChange({ rows: rows.filter((_, i) => i !== r) });
+    };
+
+    return (
+        <div className="space-y-2">
+            <input
+                type="text"
+                value={block.caption || ""}
+                onChange={(e) => onChange({ caption: e.target.value })}
+                placeholder="Caption (Table X. ...)"
+                className="w-full bg-black/30 border border-white/10 rounded px-2 py-1 text-xs text-white/80 outline-none focus:border-blue-500/50"
+            />
+            <div className="overflow-x-auto rounded border border-white/10">
+                <table className="w-full text-xs text-white/90">
+                    {header.length > 0 && (
+                        <thead className="bg-white/5">
+                            <tr>
+                                {header.map((h, i) => (
+                                    <th key={i} className="p-1 border border-white/10">
+                                        <input
+                                            type="text"
+                                            value={h}
+                                            onChange={(e) => updateHeader(i, e.target.value)}
+                                            className="w-full bg-transparent text-center font-bold outline-none focus:bg-blue-500/10 rounded"
+                                        />
+                                    </th>
+                                ))}
+                                <th className="w-6"></th>
+                            </tr>
+                        </thead>
+                    )}
+                    <tbody>
+                        {rows.map((row, r) => (
+                            <tr key={r}>
+                                {row.map((cell, c) => (
+                                    <td key={c} className="p-1 border border-white/10">
+                                        <input
+                                            type="text"
+                                            value={cell}
+                                            onChange={(e) => updateCell(r, c, e.target.value)}
+                                            className="w-full bg-transparent outline-none focus:bg-blue-500/10 rounded"
+                                        />
+                                    </td>
+                                ))}
+                                <td className="text-center">
+                                    <button
+                                        onClick={() => deleteRow(r)}
+                                        className="text-white/30 hover:text-red-400 text-[10px]"
+                                        title="Delete row"
+                                    >
+                                        ✕
+                                    </button>
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            <button
+                onClick={addRow}
+                className="text-[10px] text-white/40 hover:text-white px-2 py-1 rounded border border-white/10 hover:border-white/30"
+            >
+                + Add row
+            </button>
         </div>
     );
 }
