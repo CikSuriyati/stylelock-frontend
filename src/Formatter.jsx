@@ -95,35 +95,21 @@ const Formatter = () => {
     setToast("Manuscript loaded · 36 paragraphs detected");
   };
 
-  const handleDownload = async () => {
-    // Build a StructuredDocument from the UI's paragraph data
-    const API_URL = window.STYLELOCK_API_URL || "https://stylelock-backend.onrender.com";
+  const buildStructuredDoc = () => {
     const info = window.ARTICLE_INFO || {};
-
     const metadata = {
-      title: null,
-      authors: [],
-      affiliations: [],
-      abstract: null,
-      keywords: null,
+      title: null, authors: [], affiliations: [], abstract: null, keywords: null,
       journal: info.journal || "GADING Journal for the Social Sciences",
-      volume: info.volume || null,
-      issue: info.issue || null,
-      year: info.year || null,
+      volume: info.volume || null, issue: info.issue || null, year: info.year || null,
     };
-
     const blocks = [];
     paras.forEach((p, i) => {
       const style = getStyleAt(i);
       const text = p.text || "";
-
-      // Front-matter → metadata
       if (style === "Title")       { metadata.title = text; return; }
       if (style === "Author")      { metadata.authors.push(text); return; }
       if (style === "Affiliation") { metadata.affiliations.push(text); return; }
       if (style === "Abstract")    { metadata.abstract = text; return; }
-
-      // Body blocks
       if (style === "Heading A") {
         blocks.push({ type: "heading", level: "A", text });
       } else if (style === "Heading B") {
@@ -136,21 +122,19 @@ const Formatter = () => {
         blocks.push({ type: "equation", text, number: (p.props && p.props.number) || null });
       } else if (style === "Table Placeholder" && p.props && p.props.table_data) {
         const rows = p.props.table_data;
-        blocks.push({
-          type: "table",
-          header: rows.length > 0 ? rows[0] : [],
-          rows: rows.length > 1 ? rows.slice(1) : [],
-          caption: null,
-        });
+        blocks.push({ type: "table", header: rows[0] || [], rows: rows.slice(1), caption: null });
       } else if (style === "Image Placeholder") {
         blocks.push({ type: "figure", caption: text, src: null, alt: text });
       } else {
         blocks.push({ type: "paragraph", text, style: style || "Main Text" });
       }
     });
+    return { metadata, blocks };
+  };
 
-    const document = { metadata, blocks };
-
+  const handleDownload = async () => {
+    const API_URL = window.STYLELOCK_API_URL || "https://stylelock-backend.onrender.com";
+    const document = buildStructuredDoc();
     try {
       setToast("Rendering .docx via backend...");
       const res = await fetch(`${API_URL}/render/docx`, {
@@ -158,43 +142,54 @@ const Formatter = () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ document, ruleset_name: "mjcet", use_template: true }),
       });
-
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || `Render failed (${res.status})`);
       }
-
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = window.document.createElement("a");
       a.href = url;
-      a.download = "Ujang-2026-Community-Resilience.docx";
+      a.download = "document.docx";
       window.document.body.appendChild(a);
       a.click();
       window.document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 100);
       setToast("Downloaded .docx · rendered from GADING template");
     } catch (e) {
-      console.error("Backend DOCX render failed:", e);
+      console.error("DOCX render failed:", e);
       setToast("Download failed: " + e.message);
     }
   };
 
-  const handlePdf = () => {
-    // Print directly from the live preview pane — pixel-perfect parity with the web.
-    // Browser print dialog → "Save as PDF" produces the PDF.
-    document.body.classList.add("print-export");
-    const cleanup = () => {
-      document.body.classList.remove("print-export");
-      window.removeEventListener("afterprint", cleanup);
-    };
-    window.addEventListener("afterprint", cleanup);
-    setTimeout(() => {
-      try { window.print(); } catch (e) { cleanup(); }
-      // Some browsers don't fire afterprint reliably — failsafe
-      setTimeout(cleanup, 2000);
-    }, 100);
-    setToast("Opening print dialog · choose ‘Save as PDF’");
+  const handlePdf = async () => {
+    const API_URL = window.STYLELOCK_API_URL || "https://stylelock-backend.onrender.com";
+    const document = buildStructuredDoc();
+    try {
+      setToast("Rendering PDF via backend...");
+      const res = await fetch(`${API_URL}/render/pdf`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ document, ruleset_name: "mjcet", use_template: false }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `PDF render failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = window.document.createElement("a");
+      a.href = url;
+      a.download = "document.pdf";
+      window.document.body.appendChild(a);
+      a.click();
+      window.document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 100);
+      setToast("Downloaded PDF · rendered from backend");
+    } catch (e) {
+      console.error("PDF render failed:", e);
+      setToast("PDF failed: " + e.message);
+    }
   };
 
   // Stats
