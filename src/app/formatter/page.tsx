@@ -445,7 +445,7 @@ function UploadCard(props: {
                             Parsing...
                         </span>
                     ) : (
-                        "Ingest manuscript →  edit &amp; render"
+                        "Ingest manuscript → edit & render"
                     )}
                 </button>
 
