@@ -96,40 +96,88 @@ const Formatter = () => {
   };
 
   const handleDownload = async () => {
-    const logoDataUrl = await window.getLogoDataUrl();
-    const html = window.buildWordHtml(
-      window.MANUSCRIPT_TITLE,
-      paras,
-      getStyleAt,
-      window.ARTICLE_INFO,
-      { logoDataUrl }
-    );
+    // Build a StructuredDocument from the UI's paragraph data
+    const API_URL = window.STYLELOCK_API_URL || "https://stylelock-backend.onrender.com";
+    const info = window.ARTICLE_INFO || {};
 
-    // Use html-docx-js to convert HTML → real .docx (OOXML)
-    if (window.htmlDocx && window.htmlDocx.asBlob) {
-      try {
-        const blob = window.htmlDocx.asBlob(html, {
-          orientation: "portrait",
-          margins: { top: 1440, right: 1440, bottom: 1440, left: 1440, header: 720, footer: 720 }
+    const metadata = {
+      title: null,
+      authors: [],
+      affiliations: [],
+      abstract: null,
+      keywords: null,
+      journal: info.journal || "GADING Journal for the Social Sciences",
+      volume: info.volume || null,
+      issue: info.issue || null,
+      year: info.year || null,
+    };
+
+    const blocks = [];
+    paras.forEach((p, i) => {
+      const style = getStyleAt(i);
+      const text = p.text || "";
+
+      // Front-matter → metadata
+      if (style === "Title")       { metadata.title = text; return; }
+      if (style === "Author")      { metadata.authors.push(text); return; }
+      if (style === "Affiliation") { metadata.affiliations.push(text); return; }
+      if (style === "Abstract")    { metadata.abstract = text; return; }
+
+      // Body blocks
+      if (style === "Heading A") {
+        blocks.push({ type: "heading", level: "A", text });
+      } else if (style === "Heading B") {
+        blocks.push({ type: "heading", level: "B", text });
+      } else if (style === "Heading C") {
+        blocks.push({ type: "heading", level: "C", text });
+      } else if (style === "Reference") {
+        blocks.push({ type: "reference", raw: text });
+      } else if (style === "Equation") {
+        blocks.push({ type: "equation", text, number: (p.props && p.props.number) || null });
+      } else if (style === "Table Placeholder" && p.props && p.props.table_data) {
+        const rows = p.props.table_data;
+        blocks.push({
+          type: "table",
+          header: rows.length > 0 ? rows[0] : [],
+          rows: rows.length > 1 ? rows.slice(1) : [],
+          caption: null,
         });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = "Ujang-2026-Community-Resilience.docx";
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 100);
-        setToast("Downloaded .docx · opens in Microsoft Word");
-        return;
-      } catch (e) {
-        console.error("html-docx-js failed:", e);
+      } else if (style === "Image Placeholder") {
+        blocks.push({ type: "figure", caption: text, src: null, alt: text });
+      } else {
+        blocks.push({ type: "paragraph", text, style: style || "Main Text" });
       }
-    }
+    });
 
-    // Fallback to .doc HTML if library not available
-    window.downloadBlob("Ujang-2026-Community-Resilience.doc", html, "application/msword");
-    setToast("Download started · opens in Microsoft Word");
+    const document = { metadata, blocks };
+
+    try {
+      setToast("Rendering .docx via backend...");
+      const res = await fetch(`${API_URL}/render/docx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ document, ruleset_name: "mjcet", use_template: true }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Render failed (${res.status})`);
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = window.document.createElement("a");
+      a.href = url;
+      a.download = "Ujang-2026-Community-Resilience.docx";
+      window.document.body.appendChild(a);
+      a.click();
+      window.document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 100);
+      setToast("Downloaded .docx · rendered from GADING template");
+    } catch (e) {
+      console.error("Backend DOCX render failed:", e);
+      setToast("Download failed: " + e.message);
+    }
   };
 
   const handlePdf = () => {
