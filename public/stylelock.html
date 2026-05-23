@@ -1598,22 +1598,49 @@ const Formatter = () => {
   const [syncing, setSyncing]           = React.useState(false);
   const [toast, setToast]               = React.useState(null);
   const [showUpload, setShowUpload]     = React.useState(false);
+  const [previewHtml, setPreviewHtml]   = React.useState(null);
+  const [filename, setFilename]         = React.useState("No file loaded");
 
   const setStyleAt = (i, s) => setOverrides(prev => ({ ...prev, [i]: s }));
   const getStyleAt = (i) => styleOverrides[i] || paras[i].style;
 
-  const handleSync = () => {
+  // Update text of a single paragraph (called from onBlur in SourceParaContent)
+  const updateParaText = (i, text) =>
+    setParas(prev => prev.map((p, idx) => idx === i ? { ...p, text } : p));
+
+  const handleSync = async () => {
+    const API_URL = window.STYLELOCK_API_URL || "https://stylelock-backend.onrender.com";
     setSyncing(true);
-    setTimeout(() => {
+    try {
+      const doc = buildStructuredDoc();
+      const res = await fetch(`${API_URL}/render/html`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ document: doc, ruleset_name: "mjcet" }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Render failed (${res.status})`);
+      }
+      const html = await res.text();
+      setPreviewHtml(html);
+      setRightMode("output");
+      setToast("Synced \u00b7 Compliant output updated");
+    } catch (e) {
+      console.error("Sync failed:", e);
+      setToast("Sync failed: " + e.message);
+    } finally {
       setSyncing(false);
-      setToast("Synced · GADING style applied to 36 paragraphs");
-    }, 900);
+    }
   };
 
-  const handleNewUpload = (newParas, newInfo, stats) => {
+  const handleNewUpload = (newParas, newInfo, stats, uploadedFilename) => {
     setShowUpload(false);
     if (newParas && newParas.length > 0) {
       setParas(newParas);
+      setOverrides({});
+      setPreviewHtml(null);
+      if (uploadedFilename) setFilename(uploadedFilename);
       if (newInfo) window.ARTICLE_INFO = { ...window.ARTICLE_INFO, ...newInfo };
       const count = stats ? stats.blocks : newParas.length;
       setToast("Manuscript loaded \u00b7 " + count + " elements detected");
@@ -1623,24 +1650,41 @@ const Formatter = () => {
   const buildStructuredDoc = () => {
     const info = window.ARTICLE_INFO || {};
     const metadata = {
-      title: null, authors: [], affiliations: [], abstract: null, keywords: null,
+      title: null, authors: [], affiliations: [], abstract: null,
+      keywords: info.keywords ? info.keywords.join("; ") : null,
+      doi: info.doi || null,
       journal: info.journal || "GADING Journal for the Social Sciences",
       volume: info.volume || null, issue: info.issue || null, year: info.year || null,
     };
     const blocks = [];
+    // Heading auto-numbering counters (same logic as computeNumbering)
+    const hCount = { A: 0, B: 0, C: 0 };
+
     paras.forEach((p, i) => {
       const style = getStyleAt(i);
       const text = p.text || "";
+      // Front-matter → metadata (never become body blocks)
       if (style === "Title")       { metadata.title = text; return; }
       if (style === "Author")      { metadata.authors.push(text); return; }
       if (style === "Affiliation") { metadata.affiliations.push(text); return; }
       if (style === "Abstract")    { metadata.abstract = text; return; }
+      // Keywords / DOI rows come from the article-info table — keep in metadata only
+      if (style === "Keywords") {
+        // Override the info-derived value with whatever the user may have edited
+        metadata.keywords = text;
+        return;
+      }
+      if (style === "DOI") { metadata.doi = text; return; }
+
       if (style === "Heading A") {
-        blocks.push({ type: "heading", level: "A", text });
+        hCount.A++; hCount.B = 0; hCount.C = 0;
+        blocks.push({ type: "heading", level: "A", text, numbering: `${hCount.A}.` });
       } else if (style === "Heading B") {
-        blocks.push({ type: "heading", level: "B", text });
+        hCount.B++; hCount.C = 0;
+        blocks.push({ type: "heading", level: "B", text, numbering: `${hCount.A}.${hCount.B}` });
       } else if (style === "Heading C") {
-        blocks.push({ type: "heading", level: "C", text });
+        hCount.C++;
+        blocks.push({ type: "heading", level: "C", text, numbering: `${hCount.A}.${hCount.B}.${hCount.C}` });
       } else if (style === "Reference") {
         blocks.push({ type: "reference", raw: text });
       } else if (style === "Equation") {
@@ -1731,7 +1775,7 @@ const Formatter = () => {
 
       {/* Sub-toolbar */}
       <FormatterToolbar
-        filename="Ujang-2026-Community-Resilience.docx"
+        filename={filename}
         onSync={handleSync}
         syncing={syncing}
         focusMode={focusMode}
@@ -1753,6 +1797,7 @@ const Formatter = () => {
           hoverIdx={hoverIdx}
           setHoverIdx={setHoverIdx}
           focusMode={focusMode}
+          updateParaText={updateParaText}
         />
 
         {/* RIGHT — Formatted preview / Guide */}
@@ -1763,6 +1808,7 @@ const Formatter = () => {
             paras={paras}
             getStyleAt={getStyleAt}
             setStyleAt={setStyleAt}
+            previewHtml={previewHtml}
           />
         </div>
       </div>
@@ -1857,7 +1903,7 @@ const FormatterToolbar = ({ filename, onSync, syncing, focusMode, setFocusMode, 
 // =====================================================================
 // Source pane (LEFT)
 // =====================================================================
-const SourcePane = ({ paras, getStyleAt, setStyleAt, hoverIdx, setHoverIdx, focusMode }) => (
+const SourcePane = ({ paras, getStyleAt, setStyleAt, hoverIdx, setHoverIdx, focusMode, updateParaText }) => (
   <div className="source-pane" style={{ background: "var(--paper)", display: "flex", flexDirection: "column", minHeight: 0 }}>
 
     {/* Pane header */}
@@ -1949,7 +1995,7 @@ const SourcePane = ({ paras, getStyleAt, setStyleAt, hoverIdx, setHoverIdx, focu
                             }} title={`Source had "${para.originalStyle}" — re-classified as "${currentStyle}"`} />
                           )}
 
-                          <SourceParaContent para={para} />
+                          <SourceParaContent para={para} idx={i} updateParaText={updateParaText} />
                         </div>
                       );
                     })}
@@ -1966,7 +2012,7 @@ const SourcePane = ({ paras, getStyleAt, setStyleAt, hoverIdx, setHoverIdx, focu
 );
 
 // Renders a single source paragraph with proper visual but un-styled (raw author text style)
-const SourceParaContent = ({ para }) => {
+const SourceParaContent = ({ para, idx, updateParaText }) => {
   // In source pane everything looks like author submission — uniform-ish, but headings still bold etc.
   const baseStyle = { fontFamily: "var(--font-doc)", color: "var(--ink)", lineHeight: 1.35 };
 
@@ -2029,6 +2075,10 @@ const SourceParaContent = ({ para }) => {
     <div
       contentEditable
       suppressContentEditableWarning
+      onBlur={e => {
+        const newText = e.currentTarget.innerText;
+        if (updateParaText && newText !== para.text) updateParaText(idx, newText);
+      }}
       style={{ ...baseStyle, fontSize: "10pt", outline: "none", padding: "1px 2px", borderRadius: 2, ...extra }}
     >{para.text}</div>
   );
@@ -2037,7 +2087,7 @@ const SourceParaContent = ({ para }) => {
 // =====================================================================
 // Preview pane (RIGHT)
 // =====================================================================
-const PreviewPane = ({ mode, setMode, paras, getStyleAt, setStyleAt }) => {
+const PreviewPane = ({ mode, setMode, paras, getStyleAt, setStyleAt, previewHtml }) => {
   const renderList = mode === "output" ? paras : window.GADING_GUIDE;
 
   return (
@@ -2045,7 +2095,7 @@ const PreviewPane = ({ mode, setMode, paras, getStyleAt, setStyleAt }) => {
       <PaneHeader
         eyebrow="02"
         title={mode === "output" ? "Compliant output" : "MJCET style guide"}
-        sub={mode === "output" ? "Locked to GADING" : "Reference — read-only"}
+        sub={mode === "output" ? (previewHtml ? "Backend-rendered · MJCET" : "Locked to GADING") : "Reference — read-only"}
         right={
           <Segmented
             value={mode}
@@ -2061,7 +2111,7 @@ const PreviewPane = ({ mode, setMode, paras, getStyleAt, setStyleAt }) => {
       {/* Spacer to match LEFT ribbon height */}
       <div style={{ height: 36, borderBottom: "1px solid var(--rule)", background: "var(--surface-2)", display: "flex", alignItems: "center", padding: "0 16px" }}>
         <span className="label-mono" style={{ fontSize: 9.5 }}>
-          {mode === "output" ? "GADING / UiTM template · A4 · v6.0" : "GADING house style · v6.0 ref."}
+          {mode === "output" ? (previewHtml ? "MJCET template · B5 JIS · backend render" : "GADING / UiTM template · A4 · v6.0") : "GADING house style · v6.0 ref."}
         </span>
         <div style={{ flex: 1 }} />
         {mode === "output" && (
@@ -2072,6 +2122,18 @@ const PreviewPane = ({ mode, setMode, paras, getStyleAt, setStyleAt }) => {
         )}
       </div>
 
+      {/* Backend-rendered HTML iframe (shown after Sync is clicked) */}
+      {mode === "output" && previewHtml && (
+        <iframe
+          srcDoc={previewHtml}
+          style={{ flex: 1, border: "none", background: "#fff" }}
+          title="Compliant output"
+          sandbox="allow-same-origin"
+        />
+      )}
+
+      {/* Client-side preview (shown before first Sync, or in Guide mode) */}
+      {!(mode === "output" && previewHtml) && (
       <div className="scroll-paper" style={{ flex: 1, overflow: "auto", padding: "32px 24px 64px", minHeight: 0 }}>
         <div className="pages-stack">
           {(() => {
@@ -2209,6 +2271,7 @@ const PreviewPane = ({ mode, setMode, paras, getStyleAt, setStyleAt }) => {
           })()}
         </div>
       </div>
+      )}
     </div>
   );
 };
@@ -2598,7 +2661,7 @@ const UploadModal = ({ onClose, onDone }) => {
       }
       const data = await res.json();
       const { parsedParas, parsedInfo } = convertStructuredDoc(data.document);
-      onDone(parsedParas, parsedInfo, data.stats);
+      onDone(parsedParas, parsedInfo, data.stats, file.name);
     } catch(e) {
       setError(e.message);
       setUploading(false);
