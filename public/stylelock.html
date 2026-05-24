@@ -1677,14 +1677,14 @@ const Formatter = () => {
       if (style === "DOI") { metadata.doi = text; return; }
 
       if (style === "Heading A") {
-        hCount.A++; hCount.B = 0; hCount.C = 0;
+        hCount.A++; hCount.B = 0;
         blocks.push({ type: "heading", level: "A", text, numbering: `${hCount.A}.` });
       } else if (style === "Heading B") {
-        hCount.B++; hCount.C = 0;
+        hCount.B++;
         blocks.push({ type: "heading", level: "B", text, numbering: `${hCount.A}.${hCount.B}` });
       } else if (style === "Heading C") {
-        hCount.C++;
-        blocks.push({ type: "heading", level: "C", text, numbering: `${hCount.A}.${hCount.B}.${hCount.C}` });
+        // Heading C: bold, NO numbering per GADING format
+        blocks.push({ type: "heading", level: "C", text, numbering: null });
       } else if (style === "Reference") {
         blocks.push({ type: "reference", raw: text });
       } else if (style === "Equation") {
@@ -2061,9 +2061,9 @@ const SourceParaContent = ({ para, idx, updateParaText }) => {
     Author:       { fontSize: "11pt", textAlign: "center" },
     Affiliation:  { fontSize: "10pt", fontStyle: "italic", textAlign: "center" },
     Abstract:     { fontSize: "10pt", fontStyle: "italic", textAlign: "justify" },
-    "Heading A":  { fontSize: "12pt", fontWeight: 700 },
-    "Heading B":  { fontSize: "11pt", fontWeight: 700 },
-    "Heading C":  { fontSize: "11pt", fontStyle: "italic" },
+    "Heading A":  { fontSize: "12pt", fontWeight: 700, textTransform: "uppercase" },
+    "Heading B":  { fontSize: "11pt", fontWeight: 700, fontStyle: "italic" },
+    "Heading C":  { fontSize: "11pt", fontWeight: 700 },
     Reference:    { fontSize: "10pt" },
     "Caption B":     { fontSize: "10pt", fontStyle: "italic" },
     "Table Caption": { fontSize: "10pt", fontWeight: 700 },
